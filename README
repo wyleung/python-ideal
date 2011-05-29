@@ -1,0 +1,137 @@
+payDEAL :: the iDEAL module for Python
+
+Module: payDEAL
+Author: Wai Yi Leung (w.y.leung [a] e-sensei.nl)
+License: GPLv2.0
+
+-= Requirements =-
+
+- Python 2.4.2 or newer
+- M2Crypto package from http://chandlerproject.org/bin/view/Projects/MeTooCrypto
+- OpenSSL 0.97.x and newer
+
+
+-= Instructions =-
+
+Generate the required cert.cer and priv.pem as instructed in the iDEAL Reference Manual v2.0 ( or any newer versions ).
+
+Put these files in '/lib/includes/'
+Modify config.conf according to your own settings (MerchantID, returnurl, keypass for your priv.pem)
+
+Open ideal.py and Security.py and modify the 'SECURE_PATH' variable.
+
+
+-= Code sample =-
+
+from myapp.lib.ideal import *
+import datetime
+
+# this method is written for a webapp in Django
+
+# -- directory request example -- #
+def downloadIssuers( request ):
+	oIDC = iDEALConnector()
+	issuers = oIDC.GetIssuerList()
+	
+	# we have a list of issuers (banks), or an error
+	if issuers.IsResponseError():
+		# debug in error, printout the message
+		print issuers.getErrorCode()
+		print issuers.getErrorMessage()
+	else:
+		# we have issuers
+		print issuers.getAcquirerID() # this is your data provider, the 'host' bank were you signed your contract for iDEAL with.
+		print issuers.getDirectoryDateTimeStamp() # always handy knowing this option
+
+		dIssuers = issuers.getIssuerFullList()
+		for sIS, oIS in dIssuers.items():
+			print oIS.getIssuerID()
+			print oIS.getIssuerListType()
+			print oIS.getIssuerName()
+			# the following IDEALissuer object is webapp specific. Implement your own!
+			# the general idea is to store the issuers in a table for later use. You are not allowed to query the server to much
+			# so store this list somewhere ( in db or local in flatfile as tsv or csv )
+			issuer = IDEALissuer( issuerID=oIS.getIssuerID(), issuerListType=oIS.getIssuerListType(), issuerName=oIS.getIssuerName() )
+			issuer.save()
+	# give feedback if needed, in this case we return some text
+	return HttpResponse('Issuers updated')
+
+# -- checkout request example -- #
+def checkout( request ):
+	"""
+		Send client to the issuer (bank) for payment
+	"""
+
+	# ideal payment instructions, don't edit below this line!
+
+	cart_id = 433245		# cart_id uses as example/placeholder
+
+	amount		= 450		# this is 4.50 euro
+	issuerID	= 0051		# the issuerid of the destination bank ( bank of the client )
+	description	= 'Your order no. %s' cart_id
+	description = description[:32] # the description can only be 32 chars long
+
+	purchaseId	= '%06d' % cart_id
+	entranceCode= 'this confirmcode should be generated dynamicly and shouldnot contain spaces'
+
+	# make instance of idealconnector
+	oIDC = iDEALConnector()
+
+	# make a new transaction for this payment
+	req = oIDC.RequestTransaction( issuerId=issuerID, purchaseId=purchaseId, amount=amount, description=description, entranceCode=entranceCode)
+
+	# the request gives us a url, acces this by using the 'getIssuerAuthenticationURL' method
+	sUrl = req.getIssuerAuthenticationURL()
+
+	# send the client to the url
+	return HttpResponseRedirect( sUrl )
+
+
+# -- finish payment example -- #
+def checkPayment( request ):
+	# this method should check the payment,
+	# the bank (issuer) returns the client to the merchant via the return-url given in the configuration config.conf
+	trxid	= request.GET['trxid']
+	ec		= request.GET['ec']
+
+	# again make a instance of the connector
+	oIDC = iDEALConnector()
+
+	# what is the status?
+	req_status = oIDC.RequestTransactionStatus( trxid )
+
+
+	if not req_status.IsResponseError():
+		# this is good, the pooling-request had no error, the trxid was found
+		# hit the database and update the payment status
+		try:
+			# check the YOUR database for payments with this trxid assigned
+			# always check this along with the 'ec'
+			# as you can see, I also use 'req_status.getTransactionID()' for giving the tranactionID (trxid)
+			# this is some good practice of coding, never trust user input and be sure the iDEAL server
+			# understood the input and returning the correct data for the trxid
+			payment = Payment.objects.get( transactionId=req_status.getTransactionID(), entranceCode=ec )
+		except:
+			# here, do anything needed to inform the user about the incorrect payment or transport
+			# by now this is left empty (bad practice of software design)
+			pass
+		else:
+			# do update payment things.
+			payment.consumerName	= req_status.getConsumerName()
+			payment.consumerAccNr	= req_status.getConsumerAccountNumber()
+			payment.consumerCity	= req_status.getConsumerCity()
+			payment.status			= req_status.getStatus()
+
+			if payment.status == IDEAL_TX_STATUS_SUCCESS:
+				payment.finished	= datetime.datetime.now()
+			payment.save()
+	else:
+		# an error has occured, show an error page?
+		return HttpResponseRedirect( '/checkout/error' )
+
+	return render_to_response(
+			'step_finish_ideal.html', 
+			{
+				'payment': payment,
+				'payment_status_req': req_status, # the req_status object contains more methods, and useful for giving the user status
+			})
